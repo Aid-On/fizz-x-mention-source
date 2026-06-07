@@ -1,0 +1,108 @@
+// fizz_x_mention_source — X (旧 Twitter) メンション → 正規化コメント。
+//
+// 責務 (一行): XAPI proxy のメンションを polling して正規化コメントを流す。
+//
+// X API v2 を直接叩かず、OAuth 2.0 user context + token refresh を巻き取る
+// ローカル XAPI サーバ (別リポジトリ) 経由で読む。認証は XAPI が発行する
+// API key の Bearer (実 X の Bearer とは別物)。
+//
+// 前提エンドポイント (openaituber server/x/realClient.ts の計画仕様):
+//   GET {XAPI_BASE_URL}/api/mentions?xUserId=...&sinceId=...
+//   → {"mentions": [{"id", "text", "createdAt",
+//                     "author": {"id", "handle", "displayName"}}, ...]}
+// ※ 2026-06 時点で XAPI 側は未実装 (realClient は空配列を返す互換スタブ)。
+//   実装が入り次第このレスポンス形を正とする。形が変わるならここを直す。
+//
+// このファイルは純粋ロジックのみ: URL 構築 / レスポンス解析 / since_id 前進。
+// HTTP とループは main.almd が担う。
+
+import json
+import fizz_protocol.comment
+
+let DEFAULT_POLL_MS = 60000
+
+fn mentions_url(base_url: String, x_user_id: String, since_id: Option[String]) -> String = {
+  let base = "${base_url}/api/mentions?xUserId=${x_user_id}"
+  match since_id {
+    some(s) => "${base}&sinceId=${s}",
+    none    => base,
+  }
+}
+
+// ── JSON 取り出しヘルパ ──────────────────────────────────────────────
+
+local fn jget(v: Value, key: String) -> Value = value.get(v, key) ?? value.null()
+
+local fn jstr(v: Value, key: String) -> Option[String] =
+  result.to_option(value.as_string(jget(v, key)))
+
+local fn jarr(v: Value, key: String) -> List[Value] =
+  result.unwrap_or(value.as_array(jget(v, key)), [])
+
+// ── レスポンス解析 ───────────────────────────────────────────────────
+
+type MentionPage = {
+  comments: List[comment.Comment],
+  // ページ内最大の生 ID。次回 polling の sinceId に使う。空ページは none。
+  max_id: Option[String],
+}
+
+fn parse_mentions(body: String) -> Result[MentionPage, String] =
+  match json.parse(body) {
+    err(e) => err("invalid json: ${e}"),
+    ok(v)  => {
+      let arr = jarr(v, "mentions")
+      ok(MentionPage {
+        comments: list.filter_map(arr, mention_to_comment),
+        max_id: max_string_id(list.filter_map(arr, (m) => jstr(m, "id"))),
+      })
+    },
+  }
+
+local fn mention_to_comment(m: Value) -> Option[comment.Comment] = {
+  let id = jstr(m, "id") ?? ""
+  let text = jstr(m, "text") ?? ""
+  guard id != "" and text != "" else none
+  let author = jget(m, "author")
+  let display = jstr(author, "displayName") ?? ""
+  let handle = jstr(author, "handle") ?? ""
+  let user = if display != "" then display
+             else if handle != "" then "@${handle}"
+             else "anon"
+  some(comment.Comment {
+    id: "x-${id}",
+    user: user,
+    text: text,
+    color: none,
+    source: comment.XMention,
+  })
+}
+
+// ── since_id 前進 ────────────────────────────────────────────────────
+// snowflake ID は数値文字列。桁数が違えば長い方が大きい、同じなら辞書順。
+
+fn id_greater(a: String, b: String) -> Bool =
+  if string.len(a) != string.len(b) then string.len(a) > string.len(b)
+  else a > b
+
+fn max_string_id(ids: List[String]) -> Option[String] =
+  match ids {
+    [] => none,
+    _  => {
+      let h = list.first(ids) ?? ""
+      match max_string_id(list.drop(ids, 1)) {
+        none    => some(h),
+        some(m) => if id_greater(h, m) then some(h) else some(m),
+      }
+    },
+  }
+
+// 新しい max_id が来たときだけ前進させる (空ページで巻き戻さない)。
+fn advance_since(current: Option[String], page_max: Option[String]) -> Option[String] =
+  match page_max {
+    none    => current,
+    some(p) => match current {
+      none    => some(p),
+      some(c) => if id_greater(p, c) then some(p) else current,
+    },
+  }

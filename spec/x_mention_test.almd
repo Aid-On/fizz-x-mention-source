@@ -1,0 +1,57 @@
+import self as x
+import fizz_protocol.comment
+
+let SAMPLE = r"""
+  {"mentions": [
+    {"id": "1801", "text": "@sorasumi_bot 今日も配信ある？",
+     "createdAt": "2026-06-07T00:00:00Z",
+     "author": {"id": "u1", "handle": "fan_a", "displayName": "ファンA"}},
+    {"id": "1799", "text": "@sorasumi_bot おはよう",
+     "createdAt": "2026-06-06T23:00:00Z",
+     "author": {"id": "u2", "handle": "fan_b", "displayName": ""}}
+  ]}
+"""
+
+test "mentions normalize to comments" {
+  match x.parse_mentions(SAMPLE) {
+    ok(page) => {
+      assert_eq(list.len(page.comments), 2)
+      let first = list.first(page.comments) ?? comment.Comment { id: "", user: "", text: "", color: none, source: comment.XMention }
+      assert_eq(first.id, "x-1801")
+      assert_eq(first.user, "ファンA")
+      assert_eq(first.source, comment.XMention)
+      // displayName が空なら @handle に倒す
+      let second = list.last(page.comments) ?? first
+      assert_eq(second.user, "@fan_b")
+      assert_eq(page.max_id, some("1801"))
+    },
+    err(_) => assert(false),
+  }
+}
+
+test "empty page keeps since id" {
+  match x.parse_mentions("{\"mentions\": []}") {
+    ok(page) => {
+      assert_eq(page.max_id, none)
+      assert_eq(x.advance_since(some("1801"), page.max_id), some("1801"))
+    },
+    err(_) => assert(false),
+  }
+}
+
+test "since id only moves forward" {
+  assert_eq(x.advance_since(none, some("100")), some("100"))
+  assert_eq(x.advance_since(some("100"), some("99")), some("100"))
+  assert_eq(x.advance_since(some("100"), some("101")), some("101"))
+  // 桁が違えば長い方が大きい (snowflake)
+  assert_eq(x.advance_since(some("999"), some("1000")), some("1000"))
+}
+
+test "malformed body is an error" {
+  assert(result.is_err(x.parse_mentions("not json")))
+}
+
+test "since id appears in the url only when present" {
+  assert(string.contains(x.mentions_url("http://h", "u1", some("42")), "sinceId=42"))
+  assert(not string.contains(x.mentions_url("http://h", "u1", none), "sinceId"))
+}

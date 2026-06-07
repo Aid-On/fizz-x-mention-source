@@ -1,0 +1,54 @@
+// CLI エントリポイント — 正規化コメントを NDJSON で stdout へ流す。
+// ログ・診断はすべて stderr (stdout はデータ専用)。
+//
+//   XAPI_BASE_URL=http://localhost:3000 XAPI_KEY=... XAPI_X_USER_ID=... \
+//     fizz-x-mention-source | fizz-comment-dedupe | ...
+
+import self as x
+import fizz_protocol.comment
+import http
+import env
+import process
+
+effect fn main() -> Unit = {
+  let base = string.trim(env.get("XAPI_BASE_URL") ?? "")
+  let key = string.trim(env.get("XAPI_KEY") ?? "")
+  let uid = string.trim(env.get("XAPI_X_USER_ID") ?? "")
+  guard base != "" and key != "" and uid != "" else {
+    eprintln("[x] missing env: XAPI_BASE_URL / XAPI_KEY / XAPI_X_USER_ID")
+    process.exit(1)
+  }
+  let poll_ms = result.unwrap_or(int.parse(string.trim(env.get("X_MENTION_POLL_MS") ?? "")), x.DEFAULT_POLL_MS)
+  run(base, key, uid, poll_ms)
+}
+
+effect fn run(base: String, key: String, uid: String, poll_ms: Int) -> Unit = {
+  var since: Option[String] = none
+  // 初回フェッチは「起動前から溜まっていたメンション」— 流さずに since_id
+  // だけ前進させる (priming)。以降は sinceId 付きで差分だけ来る。
+  var primed = false
+  eprintln("[x] polling mentions every ${int.to_string(poll_ms)}ms (xUserId=${uid})")
+  while true {
+    let headers = ["authorization": "Bearer ${key}"]
+    match http.request("GET", x.mentions_url(base, uid, since), "", headers) {
+      err(e) => eprintln("[x] http error: ${e}"),
+      ok(body) => match x.parse_mentions(body) {
+        err(e) => eprintln("[x] parse error: ${e}"),
+        ok(page) => {
+          since = x.advance_since(since, page.max_id)
+          if primed then {
+            for c in page.comments {
+              println(comment.comment_to_json(c))
+            }
+          } else {
+            primed = true
+            if list.len(page.comments) > 0 then
+              eprintln("[x] primed (skipped ${int.to_string(list.len(page.comments))} pre-existing mentions)")
+            else ()
+          }
+        },
+      },
+    }
+    env.sleep_ms(poll_ms)
+  }
+}
