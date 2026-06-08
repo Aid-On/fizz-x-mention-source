@@ -18,7 +18,12 @@ effect fn main() -> Unit = {
     eprintln("[x] missing env: XAPI_BASE_URL / XAPI_KEY / XAPI_X_USER_ID")
     process.exit(1)
   }
-  let poll_ms = result.unwrap_or(int.parse(string.trim(env.get("X_MENTION_POLL_MS") ?? "")), x.DEFAULT_POLL_MS)
+  // 注: result.unwrap_or(int.parse(...), d) は effect fn 内で codegen が
+  // int.parse に auto-? を挿して build が壊れる (almide v0.25)。match で回避。
+  let poll_ms = match int.parse(string.trim(env.get("X_MENTION_POLL_MS") ?? "")) {
+    ok(n)  => n,
+    err(_) => x.DEFAULT_POLL_MS,
+  }
   run(base, key, uid, poll_ms)
 }
 
